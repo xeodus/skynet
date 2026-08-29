@@ -1,0 +1,32 @@
+[package]
+name = "skynet"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+members = [
+    "crates/telemetry",
+    "crates/edge-node",
+    "crates/origin-mock"
+]
+
+resolver = "2"
+
+[workspace.dependencies]
+axum = "0.8.9"
+futures-util = "0.3.31"
+http-body-util = "0.1.5"
+hyper = { version = "1.11.1", features = ["full"] }
+hyper-util = { version = "0.1.20", features = ["full"] }
+reqwest = { version = "0.12", features = ["stream", "rustls-tls"] }
+tokio = { version = "1.53.1", features = ["full"] }
+prometheus = "0.13"
+bytes = "1"
+rcgen = "0.12"
+
+[dev-dependencies]
+tokio = { workspace = true }
+reqwest = { workspace = true }
+origin-mock = { path = "crates/origin-mock" }
+edge-node = { path = "crates/edge-node" }
+telemetry = { path = "crates/telemetry" }

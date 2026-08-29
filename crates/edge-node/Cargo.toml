@@ -1,0 +1,11 @@
+[package]
+name = "edge-node"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+reqwest = { workspace = true }
