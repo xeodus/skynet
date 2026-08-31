@@ -85,6 +85,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
+name = "cache"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "tokio",
+]
+
+[[package]]
 name = "cc"
 version = "1.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -115,6 +123,17 @@ dependencies = [
  "cfg-if",
  "cpufeatures",
  "rand_core",
+]
+
+[[package]]
+name = "control-plane"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "serde",
+ "serde_json",
+ "steering",
+ "tokio",
 ]
 
 [[package]]
@@ -167,10 +186,14 @@ dependencies = [
 name = "edge-node"
 version = "0.1.0"
 dependencies = [
- "http-body-util",
- "hyper",
- "hyper-util",
+ "axum",
+ "bytes",
+ "cache",
+ "futures-util",
  "reqwest",
+ "serde",
+ "serde_json",
+ "telemetry",
  "tokio",
 ]
 
@@ -472,7 +495,6 @@ dependencies = [
  "socket2",
  "system-configuration",
  "tokio",
- "tower-layer",
  "tower-service",
  "tracing",
  "windows-registry",
@@ -762,6 +784,8 @@ dependencies = [
  "axum",
  "bytes",
  "futures-util",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
@@ -1123,6 +1147,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
 dependencies = [
  "serde_core",
+ "serde_derive",
 ]
 
 [[package]]
@@ -1201,9 +1226,12 @@ dependencies = [
 name = "skynet"
 version = "0.1.0"
 dependencies = [
+ "control-plane",
  "edge-node",
  "origin-mock",
  "reqwest",
+ "serde_json",
+ "steering",
  "telemetry",
  "tokio",
 ]
@@ -1235,6 +1263,13 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "steering"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "subtle"
@@ -1516,6 +1551,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
+]
+
+[[package]]
+name = "traffic-gen"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

@@ -1,267 +1,328 @@
+use axum::{
+    body::Body,
+    extract::{Request, State},
+    http::{header, StatusCode},
+    response::Response,
+    routing::get,
+    Json, Router,
+};
 use bytes::Bytes;
-use http_body::{Body, Frame, SizeHint};
-use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Empty, Full};
-use hyper::body::Incoming;
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper::{Request, Response};
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::client::legacy::Client;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use rustls::server::ServerConfig;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
-use std::time::Instant;
+use cache::{ByteLru, CachedObject, FetchOutcome, Flight, SingleFlight};
+use futures_util::stream::Stream;
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use std::{
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::{Duration, Instant},
+};
 use telemetry::EdgeMetrics;
 use tokio::net::TcpListener;
-use tokio_rustls::TlsAcceptor;
 
-pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+#[derive(Clone, Debug)]
+pub struct EdgeConfig {
+    pub node_id: String,
+    pub origin: SocketAddr,
+    pub listen: SocketAddr,
+    pub cache_max_bytes: u64,
+    pub cache_max_object_bytes: u64,
+    pub bandwidth_price: f64,
+    pub capacity: u64,
+    pub ewma_rtt_ms: f64,
+    pub control_plane: Option<String>,
+}
 
-type ProxyBody = BoxBody<Bytes, BoxError>;
-type HttpClient = Client<HttpConnector, ProxyBody>;
+impl EdgeConfig {
+    pub fn for_origin(origin: SocketAddr) -> Self {
+        Self {
+            node_id: "edge".into(),
+            origin,
+            listen: "127.0.0.1:0".parse().unwrap(),
+            cache_max_bytes: 64 * 1024 * 1024,
+            cache_max_object_bytes: 8 * 1024 * 1024,
+            bandwidth_price: 1.0,
+            capacity: 1024,
+            ewma_rtt_ms: 1.0,
+            control_plane: None,
+        }
+    }
+}
 
-pub async fn serve_plain(
-    listener: TcpListener,
-    origin_addr: SocketAddr,
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct HealthSnapshot {
+    pub node_id: String,
+    pub addr: String,
+    pub healthy: bool,
+    pub inflight: u64,
+    pub capacity: u64,
+    pub cache_bytes: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub bandwidth_price: f64,
+    pub ewma_rtt_ms: f64,
+    pub hot_keys: Vec<String>,
+}
+
+#[derive(Clone)]
+struct EdgeState {
+    config: EdgeConfig,
+    client: Client,
     metrics: Arc<EdgeMetrics>,
-) -> std::io::Result<()> {
-    let client = http_client();
+    cache: ByteLru,
+    singleflight: SingleFlight,
+}
 
-    loop {
-        let (stream, _) = listener.accept().await?;
+pub async fn serve(listener: TcpListener, origin: SocketAddr) -> std::io::Result<()> {
+    let mut config = EdgeConfig::for_origin(origin);
+    config.listen = listener.local_addr()?;
+    serve_with(listener, config).await
+}
 
-        let io = TokioIo::new(stream);
-        let metrics = metrics.clone();
-        let client = client.clone();
+pub async fn serve_with(listener: TcpListener, mut config: EdgeConfig) -> std::io::Result<()> {
+    config.listen = listener.local_addr()?;
+    let client = Client::builder()
+        .timeout(Duration::from_secs(30))
+        .pool_max_idle_per_host(64)
+        .build()
+        .expect("reqwest client should build");
 
+    let state = EdgeState {
+        cache: ByteLru::new(config.cache_max_bytes, config.cache_max_object_bytes),
+        config,
+        client,
+        metrics: Arc::new(EdgeMetrics::new()),
+        singleflight: SingleFlight::new(),
+    };
+
+    if let Some(control) = state.config.control_plane.clone() {
+        let hb_state = state.clone();
         tokio::spawn(async move {
-            let _ = serve_connection(io, origin_addr, metrics, client).await;
+            heartbeat_loop(control, hb_state).await;
         });
     }
+
+    let app = Router::new()
+        .route("/__metrics", get(metrics_handler))
+        .route("/__health", get(health_handler))
+        .fallback(proxy_handler)
+        .with_state(state);
+
+    axum::serve(listener, app).await
 }
 
-pub async fn serve_tls(
-    listener: TcpListener,
-    origin_addr: SocketAddr,
-    tls_config: Arc<ServerConfig>,
-    metrics: Arc<EdgeMetrics>,
-) -> std::io::Result<()> {
-    let acceptor = TlsAcceptor::from(tls_config);
-    let client = http_client();
+async fn metrics_handler(State(state): State<EdgeState>) -> String {
+    state.metrics.set_cache_bytes(state.cache.bytes());
+    state.metrics.render()
+}
 
+async fn health_handler(State(state): State<EdgeState>) -> Json<HealthSnapshot> {
+    Json(snapshot(&state))
+}
+
+pub fn snapshot_from_metrics(
+    config: &EdgeConfig,
+    metrics: &EdgeMetrics,
+    cache: &ByteLru,
+) -> HealthSnapshot {
+    HealthSnapshot {
+        node_id: config.node_id.clone(),
+        addr: config.listen.to_string(),
+        healthy: true,
+        inflight: metrics.inflight(),
+        capacity: config.capacity,
+        cache_bytes: cache.bytes(),
+        hits: metrics.hits(),
+        misses: metrics.misses(),
+        bandwidth_price: config.bandwidth_price,
+        ewma_rtt_ms: config.ewma_rtt_ms,
+        hot_keys: cache.keys(),
+    }
+}
+
+fn snapshot(state: &EdgeState) -> HealthSnapshot {
+    snapshot_from_metrics(&state.config, &state.metrics, &state.cache)
+}
+
+async fn heartbeat_loop(control: String, state: EdgeState) {
+    let beat_url = format!("{}/heartbeat", control.trim_end_matches('/'));
     loop {
-        let (stream, _) = listener.accept().await?;
-
-        let acceptor = acceptor.clone();
-        let metrics = metrics.clone();
-        let client = client.clone();
-
-        tokio::spawn(async move {
-            match acceptor.accept(stream).await {
-                Ok(tls_stream) => {
-                    let io = TokioIo::new(tls_stream);
-                    let _ = serve_connection(io, origin_addr, metrics, client).await;
-                }
-                Err(_) => {}
-            }
-        });
+        let snap = snapshot(&state);
+        let _ = state.client.post(&beat_url).json(&snap).send().await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
 
-pub fn tls_server_config_from_pem(
-    cert_pem: &str,
-    key_pem: &str,
-) -> Result<Arc<ServerConfig>, BoxError> {
-    let mut cert_reader = cert_pem.as_bytes();
-    let mut key_reader = key_pem.as_bytes();
+struct InflightGuard(Arc<EdgeMetrics>);
 
-    let cert_chain = rustls_pemfile::certs(&mut cert_reader)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-
-    if cert_chain.is_empty() {
-        return Err("no certificates found in PEM".into());
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.0.dec_inflight();
     }
-
-    let key = rustls_pemfile::private_key(&mut key_reader)
-        .map_err(|e| e.to_string())?
-        .ok_or("no private key found in PEM")?;
-
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-
-    let mut config = ServerConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| e.to_string())?
-        .with_no_client_auth()
-        .with_single_cert(cert_chain, key)
-        .map_err(|e| e.to_string())?;
-
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-
-    Ok(Arc::new(config))
 }
 
-fn http_client() -> HttpClient {
-    Client::builder(TokioExecutor::new()).build_http()
-}
-
-async fn serve_connection<I>(
-    io: I,
-    origin_addr: SocketAddr,
-    metrics: Arc<EdgeMetrics>,
-    client: HttpClient,
-) -> hyper::Result<()>
-where
-    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
-{
-    let service = service_fn(move |req: Request<Incoming>| {
-        let client = client.clone();
-        let metrics = metrics.clone();
-
-        async move { handle_request(req, origin_addr, metrics, client).await }
-    });
-
-    http1::Builder::new().serve_connection(io, service).await
-}
-
-async fn handle_request(
-    req: Request<Incoming>,
-    origin_addr: SocketAddr,
-    metrics: Arc<EdgeMetrics>,
-    client: HttpClient,
-) -> Result<Response<ProxyBody>, BoxError> {
+async fn proxy_handler(
+    State(state): State<EdgeState>,
+    req: Request,
+) -> Result<Response<Body>, StatusCode> {
+    state.metrics.inc_inflight();
+    let _inflight = InflightGuard(state.metrics.clone());
     let start = Instant::now();
 
-    if req.uri().path() == "/__metrics" {
-        return Ok(metrics_response(&metrics));
+    if req.method() != axum::http::Method::GET {
+        return proxy_uncached(&state, req, start).await;
     }
 
-    match forward_to_origin(req, origin_addr, client).await {
-        Ok(upstream_res) => Ok(success_response(upstream_res, start, metrics)),
-        Err(_) => Ok(error_response(
-            hyper::StatusCode::BAD_GATEWAY,
-            start,
-            metrics,
-        )),
-    }
-}
-
-async fn forward_to_origin(
-    req: Request<Incoming>,
-    origin_addr: SocketAddr,
-    client: HttpClient,
-) -> Result<Response<Incoming>, BoxError> {
-    let method = req.method().clone();
-
+    let path = req.uri().path().to_string();
     let path_and_query = req
         .uri()
         .path_and_query()
-        .map(|pq| pq.as_str().to_owned())
-        .unwrap_or_else(|| "/".to_owned());
+        .map(|pq| pq.as_str())
+        .unwrap_or("/")
+        .to_string();
+    let key = path.clone();
 
-    let upstream_uri = format!("http://{origin_addr}{path_and_query}");
+    if let Some(obj) = state.cache.get(&key) {
+        state.metrics.hit();
+        return Ok(cached_response(
+            obj,
+            &state.metrics,
+            start,
+            state.config.bandwidth_price,
+        ));
+    }
 
-    let mut builder = Request::builder().method(method).uri(upstream_uri);
-
-    {
-        let headers = builder
-            .headers_mut()
-            .expect("request builder should have headers");
-
-        for (name, value) in req.headers() {
-            if name == hyper::header::HOST || is_hop_by_hop(name.as_str()) {
-                continue;
+    match state.singleflight.join(&key) {
+        Flight::Waiter(mut rx) => {
+            state.metrics.coalesced();
+            match rx.recv().await {
+                Ok(FetchOutcome::Object(obj)) => {
+                    Ok(cached_response(
+                        obj,
+                        &state.metrics,
+                        start,
+                        state.config.bandwidth_price,
+                    ))
+                }
+                _ => {
+                    state.metrics.observe_latency(start.elapsed());
+                    Err(StatusCode::BAD_GATEWAY)
+                }
             }
-
-            headers.insert(name.clone(), value.clone());
         }
-
-        headers.insert(
-            hyper::header::HOST,
-            origin_addr.to_string().parse().map_err(|e| {
-                format!("failed to parse origin host header: {e}")
-            })?,
-        );
+        Flight::Leader(guard) => {
+            state.metrics.miss();
+            state.metrics.origin_fetch();
+            fetch_and_tee(state, key, path_and_query, start, guard).await
+        }
     }
+}
 
-    let body: ProxyBody = req
-        .into_body()
-        .map_err(|e| Box::new(e) as BoxError)
-        .boxed();
-
-    let upstream_req = builder.body(body)?;
-
-    let upstream_res = client
-        .request(upstream_req)
+async fn proxy_uncached(
+    state: &EdgeState,
+    req: Request,
+    start: Instant,
+) -> Result<Response<Body>, StatusCode> {
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+    let upstream_url = format!("http://{}{}", state.config.origin, path_and_query);
+    let upstream_response = state
+        .client
+        .request(req.method().clone(), upstream_url)
+        .send()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|_| {
+            state.metrics.observe_latency(start.elapsed());
+            StatusCode::BAD_GATEWAY
+        })?;
 
-    Ok(upstream_res)
+    Ok(stream_origin(state.clone(), upstream_response, start, None, None))
 }
 
-fn success_response(
-    res: Response<Incoming>,
+async fn fetch_and_tee(
+    state: EdgeState,
+    key: String,
+    path_and_query: String,
     start: Instant,
-    metrics: Arc<EdgeMetrics>,
-) -> Response<ProxyBody> {
-    let (mut parts, body) = res.into_parts();
-
-    parts.headers = filter_hop_headers(parts.headers);
-
-    let inner: BoxBody<Bytes, BoxError> = body
-        .map_err(|e| Box::new(e) as BoxError)
-        .boxed();
-
-    let body: ProxyBody = CountingBody::new(inner, metrics, start).boxed();
-
-    Response::from_parts(parts, body)
-}
-
-fn error_response(
-    status: hyper::StatusCode,
-    start: Instant,
-    metrics: Arc<EdgeMetrics>,
-) -> Response<ProxyBody> {
-    let inner: BoxBody<Bytes, BoxError> = Empty::<Bytes>::new()
-        .map_err(|never| match never {})
-        .boxed();
-
-    let body: ProxyBody = CountingBody::new(inner, metrics, start).boxed();
-
-    Response::builder()
-        .status(status)
-        .body(body)
-        .expect("error response should build")
-}
-
-fn metrics_response(metrics: &Arc<EdgeMetrics>) -> Response<ProxyBody> {
-    let text = metrics.render();
-
-    let body: ProxyBody = Full::new(Bytes::from(text))
-        .map_err(|never| match never {})
-        .boxed();
-
-    Response::builder()
-        .status(200)
-        .header("content-type", "text/plain; version=0.0.4")
-        .body(body)
-        .expect("metrics response should build")
-}
-
-fn filter_hop_headers(headers: hyper::HeaderMap) -> hyper::HeaderMap {
-    let mut filtered = hyper::HeaderMap::new();
-
-    for (name, value) in headers.iter() {
-        if !is_hop_by_hop(name.as_str()) {
-            filtered.insert(name.clone(), value.clone());
+    guard: cache::LeaderGuard,
+) -> Result<Response<Body>, StatusCode> {
+    let upstream_url = format!("http://{}{}", state.config.origin, path_and_query);
+    let upstream_response = match state.client.get(upstream_url).send().await {
+        Ok(res) => res,
+        Err(_) => {
+            guard.complete(FetchOutcome::Error);
+            state.metrics.observe_latency(start.elapsed());
+            return Err(StatusCode::BAD_GATEWAY);
         }
+    };
+
+    Ok(stream_origin(
+        state,
+        upstream_response,
+        start,
+        Some(key),
+        Some(guard),
+    ))
+}
+
+fn stream_origin(
+    state: EdgeState,
+    upstream_response: reqwest::Response,
+    start: Instant,
+    cache_key: Option<String>,
+    guard: Option<cache::LeaderGuard>,
+) -> Response<Body> {
+    let status = upstream_response.status();
+    let mut response_builder = Response::builder().status(status);
+
+    for (name, value) in upstream_response.headers() {
+        if is_hop_by_hop(name.as_str())
+            || name == header::CONTENT_LENGTH
+            || name == header::TRANSFER_ENCODING
+        {
+            continue;
+        }
+        response_builder = response_builder.header(name.clone(), value.clone());
     }
 
-    filtered
+    let max_object = state.cache.max_object_bytes();
+    let stream = TeeStream {
+        inner: Box::pin(upstream_response.bytes_stream()),
+        metrics: state.metrics.clone(),
+        cache: state.cache.clone(),
+        start,
+        bytes: 0,
+        finished: false,
+        status: status.as_u16(),
+        buf: Vec::new(),
+        max_object,
+        cache_key,
+        guard,
+        bandwidth_price: state.config.bandwidth_price,
+    };
+
+    response_builder
+        .body(Body::from_stream(stream))
+        .expect("edge response")
+}
+
+fn cached_response(
+    obj: CachedObject,
+    metrics: &EdgeMetrics,
+    start: Instant,
+    bandwidth_price: f64,
+) -> Response<Body> {
+    metrics.add_bytes(obj.len(), bandwidth_price);
+    metrics.observe_latency(start.elapsed());
+    Response::builder()
+        .status(obj.status)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from(obj.body))
+        .expect("cached response")
 }
 
 fn is_hop_by_hop(name: &str) -> bool {
@@ -278,82 +339,81 @@ fn is_hop_by_hop(name: &str) -> bool {
     )
 }
 
-struct CountingBody<B> {
-    inner: B,
+struct TeeStream {
+    inner: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
     metrics: Arc<EdgeMetrics>,
+    cache: ByteLru,
     start: Instant,
     bytes: u64,
     finished: bool,
+    status: u16,
+    buf: Vec<u8>,
+    max_object: u64,
+    cache_key: Option<String>,
+    guard: Option<cache::LeaderGuard>,
+    bandwidth_price: f64,
 }
 
-impl<B> CountingBody<B> {
-    fn new(inner: B, metrics: Arc<EdgeMetrics>, start: Instant) -> Self {
-        Self {
-            inner,
-            metrics,
-            start,
-            bytes: 0,
-            finished: false,
+impl TeeStream {
+    fn finish(&mut self, error: bool) {
+        if self.finished {
+            return;
         }
-    }
+        self.finished = true;
+        self.metrics.add_bytes(self.bytes, self.bandwidth_price);
+        self.metrics.observe_latency(self.start.elapsed());
 
-    fn record(&mut self) {
-        if !self.finished {
-            self.finished = true;
-
-            self.metrics.add_bytes(self.bytes);
-            self.metrics.observe_latency(self.start.elapsed());
-        }
-    }
-}
-
-impl<B> Body for CountingBody<B>
-where
-    B: Body<Data = Bytes, Error = BoxError> + Unpin,
-{
-    type Data = Bytes;
-    type Error = BoxError;
-
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        let this = self.get_mut();
-
-        match Pin::new(&mut this.inner).poll_frame(cx) {
-            Poll::Pending => Poll::Pending,
-
-            Poll::Ready(Some(Ok(frame))) => {
-                if let Some(data) = frame.data_ref() {
-                    this.bytes += data.len() as u64;
+        let outcome = if error {
+            FetchOutcome::Error
+        } else {
+            let obj = CachedObject {
+                status: self.status,
+                body: Bytes::from(std::mem::take(&mut self.buf)),
+            };
+            if let Some(key) = self.cache_key.take() {
+                if obj.cacheable() && obj.len() <= self.max_object && obj.len() > 0 {
+                    let evicted = self.cache.insert(key, obj.clone());
+                    self.metrics.add_evictions(evicted);
+                    self.metrics.set_cache_bytes(self.cache.bytes());
                 }
-
-                Poll::Ready(Some(Ok(frame)))
             }
+            FetchOutcome::Object(obj)
+        };
 
+        if let Some(guard) = self.guard.take() {
+            guard.complete(outcome);
+        }
+    }
+}
+
+impl Stream for TeeStream {
+    type Item = Result<Bytes, reqwest::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Some(Ok(chunk))) => {
+                this.bytes += chunk.len() as u64;
+                this.buf.extend_from_slice(&chunk);
+                Poll::Ready(Some(Ok(chunk)))
+            }
             Poll::Ready(Some(Err(err))) => {
-                this.record();
+                this.finish(true);
                 Poll::Ready(Some(Err(err)))
             }
-
             Poll::Ready(None) => {
-                this.record();
+                this.finish(false);
                 Poll::Ready(None)
             }
         }
     }
-
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
-    }
 }
 
-impl<B> Drop for CountingBody<B> {
+impl Drop for TeeStream {
     fn drop(&mut self) {
-        self.record();
+        if !self.finished {
+            self.finish(true);
+        }
     }
 }

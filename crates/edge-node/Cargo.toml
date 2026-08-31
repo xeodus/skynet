@@ -5,7 +5,11 @@ edition = "2024"
 
 [dependencies]
 tokio = { workspace = true }
-hyper = { workspace = true }
-hyper-util = { workspace = true }
-http-body-util = { workspace = true }
 reqwest = { workspace = true }
+bytes = { workspace = true }
+axum = { workspace = true }
+futures-util = { workspace = true }
+telemetry = { path = "../telemetry" }
+cache = { path = "../cache" }
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -7,7 +7,11 @@ edition = "2024"
 members = [
     "crates/telemetry",
     "crates/edge-node",
-    "crates/origin-mock"
+    "crates/origin-mock",
+    "crates/cache",
+    "crates/steering",
+    "crates/control-plane",
+    "crates/traffic-gen",
 ]
 
 resolver = "2"
@@ -15,14 +19,12 @@ resolver = "2"
 [workspace.dependencies]
 axum = "0.8.9"
 futures-util = "0.3.31"
-http-body-util = "0.1.5"
-hyper = { version = "1.11.1", features = ["full"] }
-hyper-util = { version = "0.1.20", features = ["full"] }
-reqwest = { version = "0.12", features = ["stream", "rustls-tls"] }
+reqwest = { version = "0.12", features = ["stream", "rustls-tls", "json"] }
 tokio = { version = "1.53.1", features = ["full"] }
 prometheus = "0.13"
 bytes = "1"
-rcgen = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [dev-dependencies]
 tokio = { workspace = true }
@@ -30,3 +32,6 @@ reqwest = { workspace = true }
 origin-mock = { path = "crates/origin-mock" }
 edge-node = { path = "crates/edge-node" }
 telemetry = { path = "crates/telemetry" }
+control-plane = { path = "crates/control-plane" }
+steering = { path = "crates/steering" }
+serde_json = { workspace = true }

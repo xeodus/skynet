@@ -1,0 +1,82 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "id": 1,
+      "targets": [
+        {
+          "expr": "rate(edge_cache_hits_total[30s]) / (rate(edge_cache_hits_total[30s]) + rate(edge_cache_misses_total[30s]))",
+          "legendFormat": "hit ratio",
+          "refId": "A"
+        }
+      ],
+      "title": "Cache hit ratio",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "id": 2,
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(edge_request_duration_seconds_bucket[30s])) by (le, instance))",
+          "legendFormat": "p50 {{instance}}",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(edge_request_duration_seconds_bucket[30s])) by (le, instance))",
+          "legendFormat": "p99 {{instance}}",
+          "refId": "B"
+        }
+      ],
+      "title": "Latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "id": 3,
+      "targets": [
+        {
+          "expr": "rate(edge_bytes_served_total[30s])",
+          "legendFormat": "bytes/s {{instance}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Bytes served",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "id": 4,
+      "targets": [
+        {
+          "expr": "edge_origin_fetches_total",
+          "legendFormat": "origin fetches {{instance}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Origin fetches",
+      "type": "timeseries"
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["skynet"],
+  "templating": { "list": [] },
+  "time": { "from": "now-15m", "to": "now" },
+  "title": "Skynet Edge",
+  "uid": "skynet-edge",
+  "version": 1
+}
